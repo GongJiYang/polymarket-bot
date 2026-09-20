@@ -1,0 +1,1 @@
+"""Polymarket platform adapters."""

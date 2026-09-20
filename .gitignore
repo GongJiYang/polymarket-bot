@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environments and builds
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Local editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime and trading evidence
+*.jsonl
+*.log
+.audit/
+audit/
+position-*.json
+position-*.lock
+
+# Local secrets and configuration
+.env
+.env.*
+*.pem
+*.key
+secrets/

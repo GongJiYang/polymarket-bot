@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "polymarket-bot"
+version = "0.1.0"
+description = "Bounded Polymarket strategy runner"
+requires-python = ">=3.11"
+dependencies = [
+  "aiohttp>=3.12,<4",
+  "polymarket-client>=0.6,<0.7",
+  "pydantic>=2.11,<3",
+  "requests>=2.32,<3",
+  "urllib3>=2.5,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9"]
+
+[project.entry-points."polymarket_bot.strategies"]
+"chainlink_terminal_spot_v9" = "polymarket_bot.strategies.chainlink_terminal:ChainlinkTerminalStrategy"
+"eth_chainlink_terminal_spot_v5" = "polymarket_bot.strategies.eth_chainlink_terminal:EthChainlinkTerminalStrategy"
+"sol_chainlink_terminal_spot_v3" = "polymarket_bot.strategies.alt_chainlink_terminal:SolChainlinkTerminalStrategy"
+"xrp_chainlink_terminal_spot_v3" = "polymarket_bot.strategies.alt_chainlink_terminal:XrpChainlinkTerminalStrategy"
+"doge_chainlink_terminal_spot_v3" = "polymarket_bot.strategies.alt_chainlink_terminal:DogeChainlinkTerminalStrategy"
+"polyrec_impulse_fade_underdog_v1" = "polymarket_bot.strategies.polyrec_adapter:PolyrecImpulseStrategy"
+
+[project.scripts]
+polymarket-bot = "polymarket_bot.cli:main"
+polymarket-bot-eth-shadow = "polymarket_bot.eth_shadow:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/polymarket_bot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
