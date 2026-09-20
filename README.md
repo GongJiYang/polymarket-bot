@@ -1,86 +1,299 @@
 # polymarket-bot
 
-Bounded Polymarket strategy runner for short-horizon crypto Up/Down markets.
+一个面向 Polymarket 加密货币 Up/Down 市场的实验性交易机器人。
 
-This repository is experimental trading infrastructure. It is not financial advice, does not guarantee execution or profit, and should not be used with money that cannot be lost.
+项目重点不是“预测下一根 K 线”，而是：读取公开市场数据，估算某个结果发生的概率，再把这个概率和盘口价格比较，在满足流动性、价格、时间和风险限制时，决定是否下单。
 
-## Status
+> **重要声明**：这是实验性交易基础设施，不是投资建议，也不保证盈利。实盘交易可能因为网络中断、盘口消失、订单部分成交、市场结算延迟或程序崩溃而亏损全部本金。请只使用可以完全损失的资金。
 
-The project supports replay, shadow, and guarded live-mode plumbing. Live trading is **disabled by default** and requires explicit operator authorization, a fresh authorization ID, compliance confirmation, and `--submit`.
+## 项目现在是什么状态
 
-The BTC live path previously experienced a real post-entry lifecycle failure: an entry was confirmed, but the local position manager exited before its exit rules could run. The accounting and settlement handling have since been repaired and covered by tests, but the system has not earned a reliability or profitability claim. Treat live mode as untrusted until independently validated with shadow runs and a small, manually supervised amount.
+项目支持三种工作方式：
 
-## Features
+1. **Replay**：用历史 JSONL 数据重放策略，不访问账户，也不下单。
+2. **Shadow**：读取真实公开行情，但只模拟信号和交易，不发送 BUY/SELL。
+3. **Live**：经过明确授权后才允许访问账户并提交订单。
 
-- Chainlink BTC/USD terminal-probability strategy for five-minute Up/Down markets.
-- BTC volatility stress gate using a 1.25x effective-volatility scenario.
-- Public-data fail-closed checks for freshness, identity, completeness, and source consistency.
-- Bounded FAK execution through the official Polymarket client.
-- Explicit authorization, session debit, order debit, and POST-count limits.
-- Durable wallet-level position journal with atomic writes, fsync, and process locking.
-- BUY/SELL pending states and exact-order confirmed-fill reconciliation.
-- Position policy: net take profit 5%, net stop loss 8%, 30-second timeout, and at most three SELL attempts.
-- Replay and shadow tooling for non-submitting validation.
+Live 模式默认受多重限制保护，但它仍然依赖本地进程，不是交易所托管止损。此前真实运行中曾出现“买入已经成交，但持仓管理在退出规则运行前异常退出”的故障。相关成本核算、成交确认和恢复流程已经修复并通过测试，但这不等于实盘可靠，也不等于策略有正收益。
 
-## Safety model
+## 用大白话解释：它到底怎么工作
 
-- Private keys and relayer API keys are read from macOS Keychain. They must never be committed, placed in commands, or written to Markdown or audit files.
-- Unknown POST outcomes are not retried automatically.
-- A fresh authorization ID and audit file are required after every restart or recovery.
-- A local stop-loss is not an exchange-hosted stop order. Process failure, stale data, unavailable settlement reads, market expiry, or insufficient liquidity can prevent an exit.
-- PnL estimates use conservative fee bounds. The SDK does not expose the exact fee amount for every individual trade.
-- A test pass is not evidence of profitability or live reliability.
+可以把机器人理解成一个“带严格刹车的概率定价程序”。一次交易大致经过下面几步：
 
-## Requirements
+### 1. 找到正在交易的市场
 
-- macOS or another POSIX environment with file locking support.
-- Python 3.11 or newer.
-- `uv`.
-- A Polymarket account configured according to the operator's own compliance and authorization requirements.
-- `polymarket-client` 0.6.x.
+机器人寻找类似下面的市场：
 
-## Install
+```text
+Bitcoin Up or Down - 5 minutes
+```
+
+它确认市场的资产、时间窗口、Up/Down token、结算规则和 Chainlink 数据来源。如果关键信息缺失、来源不一致、市场过期或时间戳异常，机器人直接等待，不猜答案。
+
+### 2. 读取两类公开信息
+
+它主要读取：
+
+- BTC 的实时价格和历史价格变化；
+- Polymarket 的 Up/Down 订单簿和可成交深度。
+
+订单簿不是“一个价格”，而是多档买价和卖价。机器人必须判断：当前价格是否真的有足够数量可成交，而不是只看最上面一档的报价。
+
+### 3. 估算最终结果概率
+
+策略假设：市场结束时，Chainlink 的终局价格会根据规定的时间加权平均价（TWAP）决定结果。
+
+机器人用：
+
+- 当前价格相对开盘参考价的位置；
+- 剩余时间；
+- 最近价格波动率；
+- 尚未开始或已经开始的终局 TWAP；
+- 正态分布近似；
+
+估算最终 Up 和 Down 的概率。
+
+这不是机器学习预测，也不是知道未来。它只是回答一个近似问题：
+
+> 按目前价格、波动幅度和剩余时间，最终 TWAP 落在目标方向的概率大约是多少？
+
+### 4. 把概率和盘口价格比较
+
+假设模型估算 Up 概率为 0.75，而盘口卖价为 0.60。直觉上，花 0.60 买一个期望价值约 0.75 的结果，可能存在价差。
+
+但机器人不会只看 `0.75 - 0.60`，还会扣除或预留：
+
+- 交易手续费；
+- 价格滑点；
+- 盘口深度不足的风险；
+- 订单数量和最小下单量限制；
+- 签名订单的价格保护。
+
+BTC 策略还会额外使用 **1.25 倍波动压力测试**：把当前有效波动率放大后重新计算概率。只有基础估计和压力估计都没有跌破门槛，才允许进入候选信号。
+
+### 5. 在买入前做最后检查
+
+机器人会重新读取市场、订单簿和账户条件，检查：
+
+- 市场身份没有变化；
+- 数据足够新；
+- 订单簿仍有足够深度；
+- 价格没有超过限制；
+- 钱包余额和授权额度满足要求；
+- 当前没有未解决的持仓或未决订单；
+- 本次和整个会话没有超过资金上限。
+
+买入前会先把 `BUY_PENDING` 写入本地状态文件。这样程序崩溃后不会简单地认为“刚才没买到”，从而重复下单。
+
+### 6. 买入后必须核对真实成交
+
+订单接口返回成功，不代表所有数量已经成交。机器人会根据订单 ID、token、市场、方向、成交状态和成交数量读取交易记录，只有精确核对后才把仓位标记为 `OPEN`。
+
+未知结果不会自动重试，因为“第一次其实成交了、第二次又买一遍”是非常危险的重复下单场景。
+
+### 7. 持仓退出规则
+
+当前持仓策略使用三条退出条件：
+
+- 净收益达到 **5%**：尝试止盈；
+- 净亏损达到 **8%**：尝试止损；
+- 持仓达到 **30 秒**：触发超时退出。
+
+实际卖出还必须满足当前盘口深度、价格保护、手续费和授权条件。30 秒是“开始尝试退出”的时间，不是“保证 30 秒卖出”。如果深度不足，系统可以分批卖出可成交的部分，但不会把卖不掉的仓位假装按零价处理。
+
+## 使用的主要原理
+
+### 概率定价
+
+把 Up/Down token 看成一个介于 0 和 1 之间的结果价格，近似理解为市场对该结果的隐含概率，再和独立模型估算的概率比较。
+
+### 波动率与随机过程近似
+
+使用最近价格变化估算短期波动率，通过剩余时间推算终局价格的不确定范围，再用正态分布近似计算终局概率。
+
+这是一个简化模型。真实 BTC 收益并不严格服从正态分布，极端波动、跳价、新闻冲击和流动性变化都会让近似失真。
+
+### TWAP 终局模型
+
+市场不是简单地看最后一笔 BTC 价格，而是根据规则指定的 Chainlink TWAP 结算。策略区分：
+
+- 终局 TWAP 尚未开始；
+- 终局 TWAP 正在累积；
+- 终局 TWAP 已经接近完成。
+
+剩余时间越短，模型的不确定性通常越小；但这不代表一定可以按理想价格成交。
+
+### 订单簿和滑点
+
+机器人读取多档盘口，估算一笔订单从第一档吃到后面几档的实际平均价格，并拒绝明显无法容纳目标数量的订单。
+
+### Fail-closed（宁可不交易）
+
+任何关键数据缺失、过期、互相矛盾或无法确认时，系统选择不产生可执行信号，而不是用默认值凑出一个答案。
+
+### 持久化状态机
+
+持仓不是内存里的一个变量，而是写入带文件锁和原子替换的本地 JSON 状态：
+
+```text
+BUY_PENDING -> BUY_SETTLING -> OPEN
+OPEN -> SELL_PENDING -> SELL_SETTLING -> OPEN / CLOSED / DUST
+```
+
+这样可以处理程序重启、订单结算延迟和部分成交。未决状态必须人工对账，不能靠猜测恢复。
+
+## 主要缺点和风险
+
+### 1. 概率模型很粗糙
+
+正态分布和短期波动率只能提供近似。它没有完整建模：
+
+- 厚尾和极端行情；
+- 跳价和突发新闻；
+- BTC 不同时间段的波动聚集；
+- Chainlink 数据更新延迟；
+- Polymarket 盘口本身的参与者偏差。
+
+模型概率看起来很精确，不代表真实误差很小。
+
+### 2. 没有证明策略长期盈利
+
+过去几次交易不能证明正期望。尤其是少量样本中，偶然方向正确很容易被误认为模型有效。
+
+目前没有足够严格的、包含手续费、滑点、部分成交、未成交订单和结算延迟的长期样本来证明收益。
+
+### 3. 止损不是交易所托管止损
+
+止损、止盈和 30 秒退出都要靠本地程序继续运行。如果出现：
+
+- 电脑休眠或进程退出；
+- 网络代理故障；
+- API 限流；
+- 订单成交查询超时；
+- 市场结束前盘口消失；
+- 卖单提交结果未知；
+
+机器人可能无法及时退出。
+
+### 4. 流动性风险很大
+
+模型可能判断价格便宜，但真正下单时盘口已经被别人吃掉。买入可以成交，不代表 30 秒后能卖出。持仓规模越大，这个问题越明显。
+
+### 5. 手续费和真实现金损益不完全可见
+
+系统使用保守手续费上界计算风险和收益，但 SDK 并不总能直接提供逐笔实际手续费。因此日志里的净收益是风险估计，不是银行账户最终现金变化。
+
+### 6. 市场规则和数据源依赖外部系统
+
+市场解析依赖 Gamma/CLOB 数据，终局依赖 Chainlink 规则和数据。任何 API 字段、市场规则、费用模型或结算流程变化，都可能使当前实现失效。
+
+### 7. 恢复机制不能消除未知订单风险
+
+如果程序在 POST 后、收到响应前崩溃，系统不能安全地假设订单成功或失败。它会保留未决状态并要求人工对账，这更安全，但意味着机器人不能完全自动运行。
+
+## 改进方向
+
+### 第一优先级：先提高可靠性，不是先放大仓位
+
+1. 用长期 shadow 数据验证每个信号，不只记录最终盈亏，还记录：
+   - 当时盘口深度；
+   - 理论成交价；
+   - 实际可成交价；
+   - 延迟；
+   - 30 秒后的可退出情况。
+2. 建立包含手续费、滑点、部分成交和未决订单的事件回放系统。
+3. 为每次 Live 会话增加独立 watchdog，检测主进程停止、状态长时间不变和市场临近结束。
+4. 把关键状态和退出告警发送到独立通道，而不是只写本地日志。
+5. 继续增加“未知 POST 结果”“重复成交记录”“条件 ID 不匹配”等恢复测试。
+
+### 第二优先级：改进模型
+
+1. 用真实历史数据校准概率，而不是直接相信正态分布。
+2. 比较历史波动率、GARCH 类模型、分位数模型和经验分布。
+3. 分时间段、行情状态和剩余时间校准概率。
+4. 单独建模 Chainlink TWAP 尚未开始、进行中和临近结束的误差。
+5. 用校准曲线、Brier score、对数损失和置信区间衡量模型，而不是只看胜率。
+
+### 第三优先级：改进交易执行
+
+1. 统计信号出现到签名、发送、成交的完整延迟。
+2. 根据订单簿深度动态限制最大数量。
+3. 为部分成交建立更明确的剩余仓位优先级。
+4. 使用独立的只读账户核对余额、成交和持仓。
+5. 在任何扩大资金前，先完成连续 shadow 样本和人工复核。
+
+### 第四优先级：改进运营和安全
+
+1. 实盘账户和开发账户完全分离。
+2. 每次运行使用新的授权 ID、有效期和审计文件。
+3. 密钥只放在 macOS Keychain，不写入命令、环境文件、日志或仓库。
+4. 设置每日最大损失、连续失败熔断和人工恢复门槛。
+5. 对公开仓库持续扫描密钥和运行时数据。
+
+## 安装
+
+要求：
+
+- Python 3.11 或更高版本；
+- `uv`；
+- macOS 或支持 POSIX 文件锁的环境；
+- `polymarket-client` 0.6.x。
+
+安装依赖：
 
 ```bash
 uv sync --extra dev
 ```
 
-Run the test suite:
+运行测试：
 
 ```bash
 uv run pytest -q
 ```
 
-Build the package:
+构建发行包：
 
 ```bash
 uv build
 ```
 
-## Commands
+## Replay 和 Shadow
 
-List registered strategies:
-
-```bash
-uv run polymarket-bot strategies
-```
-
-Run replay or shadow workflows using their respective input and audit arguments:
+查看命令帮助：
 
 ```bash
-uv run polymarket-bot replay <input.jsonl> --strategy <strategy-id>
-uv run polymarket-bot shadow --audit /tmp/polymarket-shadow.jsonl
+uv run polymarket-bot replay --help
+uv run polymarket-bot shadow --help
 ```
 
-Inspect live options without starting a session:
+使用历史 JSONL 回放：
+
+```bash
+uv run polymarket-bot replay <input.jsonl> \
+  --strategy chainlink_terminal_spot_v9
+```
+
+运行只读 shadow：
+
+```bash
+uv run polymarket-bot shadow \
+  --strategy chainlink_terminal_spot_v9 \
+  --audit /tmp/polymarket-shadow.jsonl \
+  --monitor-seconds 3600 \
+  --sample-seconds 2
+```
+
+Shadow 模式不会提交真实订单，适合先观察信号数量、盘口变化和退出可行性。
+
+## Live 模式
+
+先查看参数：
 
 ```bash
 uv run polymarket-bot live --help
 ```
 
-## Live mode
-
-Do not copy this template without replacing every placeholder and independently checking the limits:
+命令模板如下。所有尖括号内容都必须由操作者自己填写，并在运行前重新核对：
 
 ```bash
 uv run polymarket-bot live \
@@ -100,37 +313,54 @@ uv run polymarket-bot live \
   --submit
 ```
 
-After startup, the process requires the exact ARM confirmation printed in the terminal. Never reuse an authorization ID or audit file. Use `--resume-position` only to recover a journaled position with a fresh authorization; recovery never buys a new position.
+密钥从 macOS Keychain 读取，默认标签为：
 
-## Strategies
+```text
+signer-private-key
+relayer-api-key
+```
 
-| Strategy | Scope | Notes |
+不要把密钥写入命令、README、审计文件或 Git。每次重启或恢复都必须使用新的授权 ID 和新的审计路径。`--resume-position` 只恢复已有持仓，不能用来重新买入。
+
+## 当前策略
+
+| 策略 | 资产 | 说明 |
 |---|---|---|
-| `chainlink_terminal_spot_v9` | BTC | Chainlink terminal probability with BTC stress gate |
-| `eth_chainlink_terminal_spot_v5` | ETH | Chainlink terminal strategy |
-| `sol_chainlink_terminal_spot_v3` | SOL | Alternate Chainlink terminal strategy |
-| `xrp_chainlink_terminal_spot_v3` | XRP | Alternate Chainlink terminal strategy |
-| `doge_chainlink_terminal_spot_v3` | DOGE | Alternate Chainlink terminal strategy |
-| `polyrec_impulse_fade_underdog_v1` | Research | Adapter for the Polyrec impulse signal |
+| `chainlink_terminal_spot_v9` | BTC | Chainlink 终局概率模型，包含 BTC 1.25 倍波动压力门槛 |
+| `eth_chainlink_terminal_spot_v5` | ETH | Chainlink 终局策略 |
+| `sol_chainlink_terminal_spot_v3` | SOL | Chainlink 终局策略 |
+| `xrp_chainlink_terminal_spot_v3` | XRP | Chainlink 终局策略 |
+| `doge_chainlink_terminal_spot_v3` | DOGE | Chainlink 终局策略 |
+| `polyrec_impulse_fade_underdog_v1` | 研究 | Polyrec impulse 信号适配器 |
 
-## Repository layout
+## 目录结构
 
 ```text
 src/polymarket_bot/
-  adapters/       Public-data and execution boundaries
-  live/           Authorization, bounded execution, SDK transport, position journal
-  microstructure/ Probability, order-book, and market models
-  strategies/     Strategy implementations
-  cli.py          Command composition root
-  runners.py      Replay, shadow, and live orchestration
-tests/            Safety and behavior tests
-docs/             Strategy and operations documentation
+  adapters/       公开数据和执行边界
+  live/           授权、下单、官方 SDK、持仓状态机
+  microstructure/ 概率、订单簿和市场数据模型
+  strategies/     策略实现
+  cli.py          命令入口和组合根
+  runners.py      Replay、Shadow、Live 编排
+tests/            安全性和行为测试
+docs/             策略与运行文档
 ```
 
-## Related project
+## 项目来源
 
-This bot was developed from the author's related `forecasting-tools` work. Network-operation notes remain in that project; bot-specific strategy and lifecycle documentation lives under `docs/` here.
+这个机器人是在作者的 `forecasting-tools` 相关工作基础上重新拆分和改造的。Polymarket 网络、账户读取和部分运行基础设施来自原项目思路；当前仓库集中放置 BTC/多资产策略、执行边界、持仓管理和测试。
 
-## License
+## 测试状态
 
-No license has been declared yet. All rights remain with the repository owner unless a license file is added.
+最近一次完整测试结果：
+
+```text
+151 passed
+```
+
+测试通过只说明当前代码满足测试中的行为约束，不代表实盘订单一定成交，也不代表策略盈利。
+
+## 许可证
+
+当前尚未声明开源许可证。除非后续加入 LICENSE 文件，否则版权和使用权仍归仓库所有者。
